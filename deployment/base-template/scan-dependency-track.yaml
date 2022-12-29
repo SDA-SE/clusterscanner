@@ -1,0 +1,547 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: scan-dependency-track-job-template
+  namespace: clusterscanner
+spec:
+  onExit: exit-handler
+  activeDeadlineSeconds: 3600 # 60 min, needed for large scans
+  artifactRepositoryRef:
+    configMap: artifact-repositories
+    key: default-v1
+  ttlStrategy:
+    secondsAfterSuccess: 900 # 15 min
+    secondsAfterFailure: 7200
+  retryStrategy:
+    limit: 1
+  entrypoint: main # Entry point for job execution
+  inputs:
+    parameters:
+      - name: REGISTRY_SECRET
+      - name: DEPENDENCY_SCAN_CM
+      - name: DEFECTDOJO_CM
+      - name: DEFECTDOJO_SECRETS
+      - name: SCAN_ID
+      - name: team
+      - name: environment
+      - name: namespace
+      - name: scm_source_branch
+      - name: image
+      - name: image_id
+      - name: appversion
+      - name: appname
+      - name: slack
+      - name: rocketchat
+      - name: is_scan_lifetime
+      - name: is_scan_baseimage_lifetime
+      - name: is_scan_distroless
+      - name: is_scan_malware
+      - name: is_scan_dependency_check
+      - name: is_scan_runasroot
+      - name: scan_lifetime_max_days
+      - name: is_scan_new_version
+      - name: is_scan_dependency_track
+      - name: new_version_image_filter
+      - name: dependencyCheckSuppressionsConfigMapName
+      - name: imageRegistryBase
+      - name: scanjobEnvParameter
+      - name: containerType
+      - name: slackTokenSecretName
+      - name: errorTargets
+  #      - name: engagementTags
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: sbom-generation
+            template: sbom-generation
+          - name: scan-dependency-track
+            depends: sbom-generation
+            template: scan-dependency-track
+          - name: dependency-track-notification-thresholds
+            depends: scan-dependency-track
+            template: dependency-track-notification-thresholds
+          - name: results-dependency-track-dd-upload
+            depends: dependency-track-notification-thresholds
+            template: results-dependency-track-dd-upload
+            arguments:
+              parameters:
+                - name: dependency-track-notification-alerts
+                  value: "{{tasks.dependency-track-notification-thresholds.outputs.parameters.dependency-track-notification-alerts}}"
+
+    - name: sbom-generation
+      volumes:
+        - name: images
+          persistentVolumeClaim:
+            claimName: cluster-image-scanner-images
+            readOnly: true
+        - name: scandata
+          persistentVolumeClaim:
+            claimName: cluster-image-scanner-scandata
+        - name: tmp
+          emptyDir: { }
+      container:
+        resources:
+          limits:
+            cpu: '1'
+            memory: 1024Mi # due to inspecting the tar
+          requests:
+            cpu: '0.2'
+            memory: 768Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1001
+        image: "{{ workflow.parameters.imageRegistryBase }}/cluster-image-scanner-scan-syft:{{ workflow.parameters.clusterImageScannerImageTag }}"
+        command: ["/clusterscanner/entrypoint.bash"]
+        args: [
+          "packages",
+          "docker-archive:/clusterscanner/images/docker-archive-image.tar",
+          "--output",
+          "cyclonedx-json",
+          "--file",
+          "/clusterscanner/data/bom.json"
+        ]
+        env:
+          - name: IS_SCAN
+            value: "{{ workflow.parameters.is_scan_dependency_track }}"
+        envFrom:
+          - configMapRef:
+              name: "{{ workflow.parameters.scanjobEnvParameter }}"
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - name: tmp
+            mountPath: /tmp
+          - name: images
+            mountPath: /clusterscanner/images
+            subPath: "{{ workflow.parameters.image_id }}"
+            readOnly: true
+          - name: scandata
+            mountPath: /clusterscanner/data
+            subPath: "results/{{ workflow.parameters.image_id }}/sbom"
+
+    - name: scan-dependency-track
+      volumes:
+        - name: scandata
+          persistentVolumeClaim:
+            claimName: cluster-image-scanner-scandata
+        - name: tmp
+          emptyDir: { }
+      script:
+        resources:
+          limits:
+            cpu: '1'
+            memory: 128Mi
+          requests:
+            cpu: '0.2'
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1001
+        image: "{{ workflow.parameters.imageRegistryBase }}/cluster-image-scanner-base:{{ workflow.parameters.clusterImageScannerImageTag }}"
+        command: [/bin/bash]
+        imagePullPolicy: Always
+        env:
+          - name: IS_SCAN
+            value: "{{ workflow.parameters.is_scan_dependency_track }}"
+          - name: APP_NAME
+            value: "{{ workflow.parameters.appname }}"
+          - name: APP_VERSION
+            value: "{{ workflow.parameters.appversion }}" # TODO Usage of image version
+          - name: IMAGE
+            value: "{{ workflow.parameters.image }}"
+          - name: IMAGE_ID
+            value: "{{ workflow.parameters.image }}"
+          - name: DD_BRANCH_NAME
+            value: "{{ workflow.parameters.image }}"
+          - name: NAMESPACE
+            value: "{{ workflow.parameters.namespace }}"
+          - name: ENVIRONMENT
+            value: "{{ workflow.parameters.environment }}"
+          - name: TEAM
+            value: "{{ workflow.parameters.team }}"
+        envFrom:
+          - secretRef:
+              name: "dependency-track"
+          - configMapRef:
+              name: "{{ workflow.parameters.scanjobEnvParameter }}"
+          - configMapRef:
+              name: "dependency-track"
+        volumeMounts:
+          - name: tmp
+            mountPath: /tmp
+          - name: scandata
+            mountPath: /clusterscanner/data
+            subPath: "results/{{ workflow.parameters.image_id }}/sbom"
+        source: |
+          set -e
+          if [ "${IS_SCAN}" != "true" ]; then
+            echo "Dependency Track scan is disabled"
+            exit 0
+          fi
+          
+          source ./scan-common.bash        
+          parse_and_set_image_variables
+          echo "ImageName ${IMAGE_NAME}"
+          PROJECT_NAME=$(echo "${DD_PRODUCT_NAME_TEMPLATE}" | sed "s~###ENVIRONMENT###~${ENVIRONMENT}~" | sed "s~###NAMESPACE###~${NAMESPACE}~" | sed "s~###APP_NAME###~${IMAGE_NAME}~" )
+          echo "PROJECT_NAME: ${PROJECT_NAME}"
+          bomPath="/clusterscanner/data/bom.json"
+          exportFilePath="/clusterscanner/data/findings.json"
+          if [ "${DEPENDENCY_TRACK_KEY}" == "" ]; then
+           echo "Error: DEPENDENCY_TRACK_KEY not set"
+           exit 4
+          fi
+          bomBase64=$(cat "${bomPath}" | base64 -w 0)
+          echo '{ "projectName": "'${PROJECT_NAME}'", "projectVersion": "'${IMAGE_TAG}'", "autoCreate": true, "bom": "'${bomBase64}'" }' > /tmp/tmpfile
+          curl -X "PUT" \
+            "${DEPENDENCY_TRACK_URL}/api/v1/bom" \
+            -H 'Content-Type: application/json' \
+            -H "X-API-Key: ${DEPENDENCY_TRACK_KEY}" \
+            -d @/tmp/tmpfile \
+            --silent \
+            --show-error \
+            --output /tmp/token.json
+          token=$(cat /tmp/token.json | jq -r '.token')
+
+          counter=0
+          processingPerformed="false"
+          MAX_RETRIES=60
+          while [ "${processingPerformed}" == "true" ]; do
+           let counter=counter+1
+           url="${DEPENDENCY_TRACK_URL}/api/v1/bom/token/${token}"
+           echo "Fetching $url"
+           processingPerformed=$(curl ${url} \
+            --header 'Accept: application/json' \
+            -H "X-API-Key: ${DEPENDENCY_TRACK_KEY}" \
+            --silent \
+            --show-error \
+           | jq '.processing')
+           echo "Processing status '${processingPerformed}' from Dependency Track"
+           if [ ${counter} -gt ${MAX_RETRIES} ]; then
+             echo "ERROR Reached maximum retries of ${MAX_RETRIES}, stop trying to get processing status"
+             exit 2
+           fi
+           sleep 2
+          done
+          echo "GET ${DEPENDENCY_TRACK_URL}/api/v1/project?name=${PROJECT_NAME}&.."
+          nameParameterUrlEncoded=$(printf %s "${PROJECT_NAME}" | jq -sRr @uri)
+          curl "${DEPENDENCY_TRACK_URL}/api/v1/project?name=${nameParameterUrlEncoded}" \
+           --silent \
+           --show-error \
+           --header 'Accept: application/json' \
+           -H "X-API-Key: ${DEPENDENCY_TRACK_KEY}" \
+           --output /tmp/project.json
+
+          echo "/tmp/project.json"
+          cat /tmp/project.json
+          cat /tmp/project.json | jq -r '.[] | select(.version=="'${IMAGE_TAG}'") | .uuid' > /tmp/project-uuid.txt
+
+          export UUID=$(cat /tmp/project-uuid.txt)
+          if [ "${UUID}" == "" ]; then
+           echo "Error: UUID has the unexpceted value '${UUID}'"
+           exit 1
+          fi
+          if [ $(echo "${UUID}" | wc -l) -ne 1 ]; then
+           echo "Error: UUID '${UUID}' has unexpected newline"
+           exit 3
+          fi
+
+          echo "Fetching ${DEPENDENCY_TRACK_URL}/api/v1/finding/project/${UUID}/export"
+          
+          
+          
+          
+          #purl="^(?:(?!pkg:deb).)*$"
+          #purlEncodedValue=$(printf %s "${purl}" | jq -sRr @uri)
+          curl "${DEPENDENCY_TRACK_URL}/api/v1/finding/project/${UUID}/export" \
+           --silent \
+           --show-error \
+           -H "X-API-Key: ${DEPENDENCY_TRACK_KEY}" \
+           --output ${exportFilePath}
+          exit 0
+          ## In development: Check for new package version
+          DEFAULT_NPM_BASE_URL="https://registry.npmjs.org";
+          NPM_API_LATEST_URL="/-/package/%s/dist-tags";
+          # http://localhost:8071/api/v1/component/project/bc33ac48-fb26-4142-99c3-96fdb0f07066?searchText=&sortOrder=asc&pageSize=100&pageNumber=1
+          # jq | '.[]'
+          # foreach
+          if  [ repositoryType == "NPM" ]; then
+            packageName="abab"
+            version="1.0.0"
+
+            packageNameEncoded=$(printf %s "${packageName}" | jq -sRr @uri)
+
+            times=$(curl --silent  "${DEFAULT_NPM_BASE_URL}/${packageNameEncoded}" | jq -r ".time")
+            next=false;
+            for listedVersion in $versions; do
+              if [ "${next}" == "true" ];then
+                break;
+              fi;
+              #echo "${version} == ${listedVersion}";
+              if [ "${version}" == "${listedVersion}" ]; then
+                next="true";
+              fi
+            done
+
+            publishedDate=$(curl --silent  "${DEFAULT_NPM_BASE_URL}/${packageNameEncoded}" | jq -r ".time[\"${listedVersion}\"]")
+
+          fi
+
+    - name: dependency-track-notification-thresholds
+      volumes:
+        - name: tmp
+          emptyDir: { }
+      outputs:
+        parameters:
+          - name: dependency-track-notification-alerts
+            valueFrom:
+              path: /tmp/output.json
+      script:
+        resources:
+          limits:
+            cpu: '1'
+            memory: 256Mi
+          requests:
+            cpu: '0.2'
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1001
+        image: "{{ workflow.parameters.imageRegistryBase }}/cluster-image-scanner-base:{{ workflow.parameters.clusterImageScannerImageTag }}"
+        command: [/bin/bash]
+        imagePullPolicy: IfNotPresent
+        env:
+          - name: CONTAINER_TYPE
+            value: "{{ workflow.parameters.containerType }}"
+          - name: DEPENDENCY_TRACK_NOTIFICATION_THRESHOLDS_APPLICATION
+            value: '{
+              "maven": {"critical": 1, "high": 1, "medium": 100},
+              "golang": {"critical": 1, "high": 1, "medium": 100},
+              "npm": {"critical": 1, "high": 1, "medium": 100},
+              "deb": {"critical": 8, "high": 20, "medium": 100},
+              "rpm": {"critical": 8, "high": 20, "medium": 100},
+              "pypi": {"critical": 8, "high": 20, "medium": 100},
+              "alpine": {"critical": 8, "high": 20, "medium": 100}}'
+          - name: DEPENDENCY_TRACK_NOTIFICATION_THRESHOLDS_THIRD_PARTY
+            value: '{
+              "maven": {"critical": 99, "high": 999, "medium": 9999},
+              "golang": {"critical": 99, "high": 999, "medium": 9999},
+              "pypi": {"critical": 99, "high": 999, "medium": 9999},
+              "npm": {"critical": 99, "high": 9999, "medium": 9999},
+              "deb": {"critical": 30, "high": 100, "medium": 9999},
+              "rpm": {"critical": 30, "high": 100, "medium": 9999},
+              "alpine": {"critical": 30, "high": 100, "medium": 9999}}'
+        envFrom:
+          - configMapRef:
+              name: "{{ workflow.parameters.scanjobEnvParameter }}"
+        volumeMounts:
+          - name: tmp
+            mountPath: /tmp
+        source: |
+          set -e
+          
+          TARGET=/tmp/output.json
+          
+          if [ "${CONTAINER_TYPE}" == "application" ]; then
+            CONTENT="${DEPENDENCY_TRACK_NOTIFICATION_THRESHOLDS_APPLICATION}"
+          elif [ "${CONTAINER_TYPE}" == "third-party" ]; then
+            CONTENT="${DEPENDENCY_TRACK_NOTIFICATION_THRESHOLDS_THIRD_PARTY}"
+          else
+            CONTENT="${DEPENDENCY_TRACK_NOTIFICATION_THRESHOLDS_APPLICATION}"
+          fi
+          echo "${CONTENT}" > ${TARGET}
+          echo "${CONTENT}"
+
+    - name: results-dependency-track-dd-upload
+      volumes:
+        - name: scandata
+          persistentVolumeClaim:
+            claimName: cluster-image-scanner-scandata
+        - name: tmp
+          emptyDir: { }
+      inputs:
+        parameters:
+          - name: dependency-track-notification-alerts
+      outputs:
+        artifacts:
+          - name: results-dd-dependency-track-test-link
+            path: /tmp/defectDojoTestLink.txt
+          - name: is-finding-file
+            path: /tmp/isFinding
+          - name: findings-file
+            path: /tmp/findings.json
+      container:
+        resources:
+          limits:
+            cpu: '1'
+            memory: 256Mi
+          requests:
+            cpu: '0.2'
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 1001
+        image: "{{ workflow.parameters.imageRegistryBase }}/defectdojo-client:3.1"
+        volumeMounts:
+          - name: tmp
+            mountPath: /tmp
+          - name: scandata
+            mountPath: /tmp/dependency-track-results
+            subPath: "results/{{ workflow.parameters.image_id }}/sbom"
+            readOnly: true
+        imagePullPolicy: Always
+        command: [ "java", "-cp", "@/app/jib-classpath-file", "org.sdase.Main" ]
+        envFrom:
+          - configMapRef:
+              name: "{{ workflow.parameters.DEFECTDOJO_CM }}"
+          - configMapRef:
+              name: "{{ workflow.parameters.scanjobEnvParameter }}"
+          - secretRef:
+              name: "{{ workflow.parameters.DEFECTDOJO_SECRETS }}"
+        env:
+          - name: APP_NAME
+            value: "{{ workflow.parameters.appname }}"
+          - name: DD_BRANCH_NAME
+            value: "{{ workflow.parameters.image }}"
+          - name: DD_REPORT_TYPE
+            value: "Dependency Track Finding Packaging Format (FPF) Export"
+          - name: NAMESPACE
+            value: "{{ workflow.parameters.namespace }}"
+          - name: ENVIRONMENT
+            value: "{{ workflow.parameters.environment }}"
+          - name: DD_TEAM
+            value: "{{ workflow.parameters.team }}"
+          - name: DD_REPORT_PATH
+            value: "/tmp/dependency-track-results/findings.json"
+          - name: EXIT_CODE_ON_FINDING
+            value: "0"
+          - name: EXIT_CODE_ON_MISSING_REPORT
+            value: "0" # make the job successful
+          - name: DD_MINIMUM_SEVERITY # notify for each unhandled vulnerability of the given severity (or higher)
+            value: "High"
+          - name: DEPENDENCY_TRACK_UNHANDLED_PACKAGES_MINIMUM_TO_ALERT
+            value: "{{ inputs.parameters.dependency-track-notification-alerts }}"
+
+    - name: exit-handler
+      script:
+        command: [/bin/bash]
+        resources:
+          limits:
+            cpu: '1'
+            memory: 128Mi
+          requests:
+            cpu: '0.2'
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 1001
+        image: "{{ workflow.parameters.imageRegistryBase }}/cluster-image-scanner-base:{{ workflow.parameters.clusterImageScannerImageTag }}"
+        imagePullPolicy: IfNotPresent
+        env: # TODO check for email creds
+          - name: MESSAGE_TARGETS
+            value: "{{ workflow.parameters.errorTargets }}"
+          - name: SLACK_CLI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: "{{ workflow.parameters.slackTokenSecretName }}"
+                key: SLACK_CLI_TOKEN
+        envFrom:
+          - configMapRef:
+              name: "scanjob-env-parameter"
+        source: |
+          if [ "${MESSAGE_TARGETS}" == "" ]; then
+            echo "MESSAGE_TARGETS set, exiting"
+            exit 1
+          fi
+          if [ "${JOB_EXECUTION_NAMESPACE}" == "" ]; then # comming from scanjob-parameter
+            JOB_EXECUTION_NAMESPACE="clusterscanner"
+          fi
+          failures='{{workflow.failures}}'
+          failures=$(echo "${failures:1:-1}" | sed 's#\\"#"#g')
+          echo "failures"
+          echo "${failures}"
+          sendMessageViarocketchat() {
+            channel="${1}"
+          
+            message=$(echo "${failures}" | jq -r '.[] | {"pretext": "_INFO_","fields": [{"title": "", "short": true, "value": "- *name:* _ \(.displayName)_\n- *template:* _\(.templateName)_\n- *message:* _\(.message)_\n- *phase:* _\(.phase)_\n- *podName:* _\(.podName)_\n- *finishedAt:* _\(.finishedAt)_\n"}]}' | jq -s .)
+            echo "{\"channel\": \"${channel}\", \"author_name\": \"ClusterImageScanner\", \"text\": \"Problem during ClusterImageScanner workflow job execution\", \"attachments\": ${message}}" > /tmp/slack-template.json
+          
+            if [ "${ROCKET_CHAT_USER_ID}" == "" ]; then # ROCKET_CHAT_USER_ID comes from cm scanjob-parameter
+              echo "No ROCKET_CHAT_USER_ID set"
+              exit 3
+            fi
+            if [ "${SLACK_CLI_TOKEN}" == "" ]; then
+              echo "No SLACK_CLI_TOKEN set"
+              exit 2
+            fi
+          
+            echo "Sending to rocketchat ${SLACK_MESSAGE_ENDPOINT} ${channel}"
+            curl -H "Content-type: application/json" \
+              -d @/tmp/slack-template.json \
+              -H "X-Auth-Token: ${SLACK_CLI_TOKEN}" \
+              -H "X-User-Id: ${ROCKET_CHAT_USER_ID}" \
+              -X POST \
+              "${SLACK_MESSAGE_ENDPOINT}"
+          }
+          sendMessageViaslack() {
+            channel="${1}"
+          
+            message=$(echo "${failures}" | jq -r '.[] | {"type": "section","text": {"type": "mrkdwn","text": "- *name:* _ \(.displayName)_\n- *template:* _\(.templateName)_\n- *message:* _\(.message)_\n- *phase:* _\(.phase)_\n- *podName:* _\(.podName)_\n- *finishedAt:* _\(.finishedAt)_\n"}},{"type": "divider"}' | jq -s .)
+            echo "{\"channel\": \"${channel}\", \"author_name\": \"ClusterImageScanner\", \"blocks\": ${message}}" > /tmp/slack-template.json
+            cat /tmp/slack-template.json
+          
+            if [ "${SLACK_CLI_TOKEN}" == "" ]; then
+              echo "No SLACK_CLI_TOKEN set"
+              exit 2
+            fi
+          
+            curl \
+              -H "Content-type:application/json" \
+              -H "Authorization: Bearer ${SLACK_CLI_TOKEN}" \
+              -X POST \
+              -d @/tmp/slack-template.json \
+              "${SLACK_MESSAGE_ENDPOINT}"
+          }
+          
+          fn_exists() { declare -F "$1" > /dev/null; }
+          
+          if [[ "${failures}" == "" ]] || [[ "${failures}" == "[]" ]] || [[ "${failures}" == "null" ]]; then
+            echo "No message, exit 0" 
+            exit 0
+          fi
+          echo "${MESSAGE_TARGETS}" |  jq -c '.[]' | while read i; do
+            channel=$(echo "${i}" | jq -r '.channel')
+            type=$(echo "${i}" | jq -r '.type')
+            echo "Sending via ${type} to channel ${channel}"
+            toCall="sendMessageVia$type"
+            if ! fn_exists ${toCall} ; then
+              echo "Message type '${type}' doesn't exit"
+              exit 1
+            fi
+          
+            ${toCall} "${channel}"
+          done
